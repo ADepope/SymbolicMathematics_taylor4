@@ -134,7 +134,7 @@ def eval_test_zero(eq):
 
 class CharSPEnvironment(object):
 
-    TRAINING_TASKS = {'prim_fwd', 'prim_bwd', 'prim_ibp', 'ode1', 'ode2'}
+    TRAINING_TASKS = {'prim_fwd', 'prim_bwd', 'prim_ibp', 'ode1', 'ode2', 'taylor4'}
 
     # https://docs.sympy.org/latest/modules/functions/elementary.html#real-root
 
@@ -929,6 +929,78 @@ class CharSPEnvironment(object):
 
         return x, y
 
+
+    @timeout(8)
+    def gen_taylor_approx(self, rng):
+        """
+        Generate pairs of (function, 4th order Taylor approximation).
+        """
+        self.taylor_stats = np.zeros(10, dtype=np.int64)
+        x = self.variables['x']
+
+        # Randomly select the number of operations
+        if rng.randint(40) == 0:
+            nb_ops = rng.randint(0, 3)
+        else:
+            nb_ops = rng.randint(3, self.max_ops + 1)
+
+        try:
+            # Generate a random expression
+            f_expr = self._generate_expr(nb_ops, self.max_int, rng)
+            infix = self.prefix_to_infix(f_expr)
+            f = self.infix_to_sympy(infix)
+
+            # Process function: simplify coefficients, remove unnecessary constants
+            if rng.randint(2) == 0:
+                f = remove_root_constant_terms(f, x, 'add')
+            f = self.reduce_coefficients(f)
+            f = self.simplify_const_with_coeff(f)
+            f = self.reindex_coefficients(f)
+
+            # Compute 4th-order Taylor expansion at x = 0
+            self.taylor_stats[-1] += 1
+            taylor_f = sp.series(f, x, 0, 5).removeO()
+
+            # Handle cases where expansion fails or results in invalid expressions
+            if has_inf_nan(taylor_f) or taylor_f.has(sp.Piecewise):
+                self.taylor_stats[1] += 1
+                return None
+
+            # Convert expressions back to prefix notation
+            f_prefix = self.sympy_to_prefix(f)
+            taylor_prefix = self.sympy_to_prefix(taylor_f)
+
+            # Skip too long sequences
+            if max(len(f_prefix), len(taylor_prefix)) + 2 > self.max_len:
+                return None
+
+            # Ensure number of operators is within expected range
+            real_nb_ops = sum(1 if op in self.OPERATORS else 0 for op in f_prefix)
+            if real_nb_ops < nb_ops / 2:
+                return None
+
+            self.taylor_stats[4] += 1
+            if self.taylor_stats[-1] % 500 == 0:
+                logger.debug(f"{self.worker_id:>2} TAYLOR STATS {self.taylor_stats}")
+
+        except TimeoutError:
+            raise
+        except (ValueError, AttributeError, TypeError, OverflowError, NotImplementedError, UnknownSymPyOperator, ValueErrorExpression):
+            return None
+        except Exception as e:
+            logger.error("An unknown exception of type {0} occurred in line {1} for expression \"{2}\". Arguments:{3!r}.".format(
+                type(e).__name__, sys.exc_info()[-1].tb_lineno, infix, e.args))
+            return None
+
+        # Define input (expression) and output (Taylor series)
+        x_seq = f_prefix
+        y_seq = taylor_prefix
+        x_seq = self.clean_prefix(x_seq)
+        y_seq = self.clean_prefix(y_seq)
+
+        return x_seq, y_seq
+
+
     PRIM_CACHE = {}
     PRIM_COUNT = [0, 0]
 
@@ -1497,6 +1569,8 @@ class EnvDataset(Dataset):
                     xy = self.env.gen_ode1(self.rng)
                 elif self.task == 'ode2':
                     xy = self.env.gen_ode2(self.rng)
+                elif self.task == 'taylor4':
+                    xy = self.env.gen_taylor_approx(self.rng)
                 else:
                     raise Exception(f'Unknown data type: {self.task}')
                 if xy is None:
